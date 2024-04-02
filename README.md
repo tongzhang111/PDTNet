@@ -133,11 +133,6 @@ python3 -m torch.distributed.launch \
 ### Pretrained Model Weights
 We provide our trained checkpoints for results reproducibility.
 
-| Dataset | resolution | url | m_vIoU/vIoU@0.3/vIoU@0.5 | size |
-|:----:|:-----:|:-----:|:-----:|:-----:|
-| HC-STVG | 420 | [Model](https://huggingface.co/Gstar666/CGSTVG/resolve/main/hcstvg.pth?download=true)  | 38.4/61.5/36.3 | 3.4 GB |
-| HC-STVG2 | 420 | [Model](https://huggingface.co/Gstar666/CGSTVG/resolve/main/hcstvg2.pth?download=true)  | 39.5/64.5/36.3 | 3.4 GB |
-| VidSTG | 420 | [Model](https://huggingface.co/Gstar666/CGSTVG/resolve/main/vidstg.pth?download=true)  | 34.0/47.7/33.1 | 3.4 GB |
 
 
 ## Experiments
@@ -150,13 +145,4 @@ We provide our trained checkpoints for results reproducibility.
 ## Acknowledgement
 This repo is partly based on the open-source release from [STCAT](https://github.com/jy0205/STCAT) and the evaluation metric implementation is borrowed from [TubeDETR](https://github.com/antoyang/TubeDETR) for a fair comparison.
 
-## Citation
-⭐ If you find this repository useful, please consider giving it a star and citing it:
-```
-@article{gu2024context,
-  title={Context-Guided Spatio-Temporal Video Grounding},
-  author={Gu, Xin and Fan, Heng and Huang, Yan and Luo, Tiejian and Zhang, Libo},
-  journal={arXiv preprint arXiv:2401.01578},
-  year={2024}
-}
-```
+
