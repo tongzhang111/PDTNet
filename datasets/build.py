@@ -37,8 +37,8 @@ def build_transforms(cfg, is_train=True):
                     T.RandomResize(scales, max_size=max_size),
                     T.Compose(
                         [
-                            T.RandomResize([400, 500, 600]),
-                            T.RandomSizeCrop(384, 600),
+                            T.RandomResize([300,400,500]),
+                            T.RandomSizeCrop(384, 500),
                             T.RandomResize(scales, max_size=max_size),
                         ]
                     ),
