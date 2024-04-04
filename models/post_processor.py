@@ -9,7 +9,15 @@ from torch import nn
 
 from utils.box_utils import box_cxcywh_to_xyxy
 
-    
+def _clamp_bbox(bbox, h, w):
+    bbox[:,0] = bbox[:,0].clamp(max=w)
+    bbox[:,1] = bbox[:,1].clamp(max=h)
+    bbox[:,2] = bbox[:,2].clamp(max=w)
+    bbox[:,3] = bbox[:,3].clamp(max=h)
+
+    return bbox
+
+
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
     
@@ -26,6 +34,7 @@ class PostProcess(nn.Module):
         pred_boxes = boxes * scale_fct
         # Avoid x1 y1 < 0
         pred_boxes = pred_boxes.clamp(min=0)
+        pred_boxes = _clamp_bbox(pred_boxes, img_h, img_w)
 
         b, t, _ = out_sted.shape
         device = out_sted.device
