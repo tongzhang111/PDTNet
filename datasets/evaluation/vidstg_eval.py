@@ -83,10 +83,10 @@ class VidSTGiouEvaluator:
             }
             
             union_predgt = set([
-                frame_id for frame_id in range(min_start, max_end)
+                frame_id for frame_id in range(min_start, max_end+1)
             ])
             inter_predgt = set(
-                [frame_id for frame_id in range(max_start, min_end)]
+                [frame_id for frame_id in range(max_start, min_end+1)]
             )
 
             viou = 0
