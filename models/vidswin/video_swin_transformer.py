@@ -320,7 +320,6 @@ class PatchMerging(nn.Module):
 
 
 # cache each stage results
-@lru_cache()
 def compute_mask(D, H, W, window_size, shift_size, device):
     img_mask = torch.zeros((1, D, H, W, 1), device=device)  # 1 Dp Hp Wp 1
     cnt = 0
