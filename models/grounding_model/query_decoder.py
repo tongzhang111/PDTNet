@@ -10,7 +10,7 @@ from .attention import MultiheadAttention
 from ..bert_model.bert_module import BertLayerNorm, BertLayer_Cross
 from easydict import EasyDict as EDict
 
-
+# @profile
 class QueryDecoder(nn.Module):
 
     def __init__(self, cfg):
@@ -34,7 +34,7 @@ class QueryDecoder(nn.Module):
             return_intermediate=return_intermediate_dec,
             return_weights=self.return_weights,
             d_model=d_model,
-            query_dim=2
+            query_dim=4
         )
 
         self.time_decoder = TimeDecoder(
@@ -45,8 +45,6 @@ class QueryDecoder(nn.Module):
             d_model=d_model
         )
 
-        self.refbbox_embed = nn.Embedding(1, 4)
-
         # The position embedding of global tokens
         if cfg.MODEL.CG.USE_LEARN_TIME_EMBED:
             self.time_embed = SeqEmbeddingLearned(self.video_max_len + 1, d_model)
@@ -56,9 +54,9 @@ class QueryDecoder(nn.Module):
         self.pos_fc = nn.Sequential(
             BertLayerNorm(256, eps=1e-12),
             nn.Dropout(0.1),
-            nn.Linear(256, 2),
+            nn.Linear(256, 4),
             nn.ReLU(True),
-            BertLayerNorm(2, eps=1e-12),
+            BertLayerNorm(4, eps=1e-12),
         )
 
         self.time_fc = nn.Sequential(
@@ -95,6 +93,15 @@ class QueryDecoder(nn.Module):
         frames_cls = encoded_info["frames_cls"]  # [n_frames, d_model]
         videos_cls = encoded_info["videos_cls"]  # the video-level gloabl contextual token, b x d_model
 
+        meat_info = torch.zeros([1, 2])
+        meat_info[0, 0] = targets[0]['img_size'][0]
+        meat_info[0, 1] = targets[0]['img_size'][1]
+        meat_info = {
+            'size': meat_info,  # (bs, 2)  W, H
+        }
+        _, f, h, w = encoded_feature.shape[1], encoded_feature.shape[2], fea_map_size[0], fea_map_size[1]
+        meat_info["src_size"] = _, f, h, w
+
 
         b = len(encoded_info["durations"])
         t = max(encoded_info["durations"])
@@ -116,13 +123,7 @@ class QueryDecoder(nn.Module):
         key_pos = torch.cat([mesh[1].reshape(-1)[..., None], mesh[0].reshape(-1)[..., None]], -1).to(device)
         key_pos = key_pos.unsqueeze(0).repeat(t, 1, 1)
 
-        refbbox_embedweight = self.refbbox_embed.weight
-        refbbox_embedweight = refbbox_embedweight.unsqueeze(1)
-        refbbox_embedweight = refbbox_embedweight.repeat(1, t, 1)
-        refbbox_embedweight = refbbox_embedweight.transpose(0, 1)
-        refbbox_embedweight = refbbox_embedweight.sigmoid()
 
-        # x_boxes = x_boxes.squeeze(1)
 
         tgt = torch.zeros(t, b, self.d_model).to(device)
 
@@ -141,6 +142,7 @@ class QueryDecoder(nn.Module):
         inf = -1e32
         out_sted = outputs_time[1][-1]
         out_sted = out_sted.detach()
+
         for i_b in range(len(durations)):
             duration = durations[i_b]
             sted_prob = (torch.ones(t, t) * inf).tril(0).to(device)
@@ -187,8 +189,7 @@ class QueryDecoder(nn.Module):
 
         outputs_pos = self.decoder(
             query_tgt=tgt,  # t x b x c
-            salient_point=pos_query,  # n_queriesx(b*t)xF
-            salient_bbox=refbbox_embedweight,
+            pred_boxes=pos_query,  # n_queriesx(b*t)xF
             query_time=query_time_embed,
             query_mask=query_mask,  # bx(t*n_queries)
             encoded_feature=encoded_feature,  # n_tokens x n_frames x c
@@ -201,12 +202,14 @@ class QueryDecoder(nn.Module):
             time_info=self.time_embed2(outputs_time[0][-1]).squeeze()
         )
 
+        del encoded_feature, vis_memory, vis_memory___, pred_steds, meat_info, temp_prob_map
+        torch.cuda.empty_cache()
+
         return outputs_pos, outputs_time
 
 
 class PosDecoder(nn.Module):
-    def __init__(self, cfg, num_layers, return_intermediate=False, return_weights=False, d_model=256, query_dim=2, bbox_dim=4, keep_query_pos=False,
-                 query_scale_type='cond_elewise', bbox_embed_diff_each_layer=False,):
+    def __init__(self, cfg, num_layers, return_intermediate=False, return_weights=False, d_model=256, query_dim=4):
         super().__init__()
         self.layers = nn.ModuleList([PosDecoderLayer(cfg) for _ in range(num_layers)])
         self.num_layers = num_layers
@@ -218,21 +221,10 @@ class PosDecoder(nn.Module):
 
         self.query_scale = MLP(d_model, d_model, d_model, 2)
         self.ref_point_head = MLP(query_dim // 2 * d_model, d_model, d_model, 2)
-        self.ref_bbox_head = MLP(bbox_dim // 2 * d_model, d_model, d_model, 2)
         self.bbox_embed = None
         self.conf = MLP(d_model, d_model, 1, 2, dropout=0.3)
         self.conf2 = MLP(d_model, d_model, 1, 2, dropout=0.3)
 
-        assert query_scale_type in ['cond_elewise', 'cond_scalar', 'fix_elewise']
-        self.query_scale_type = query_scale_type
-        if query_scale_type == 'cond_elewise':
-            self.query_scale = MLP(d_model, d_model, d_model, 2)
-        elif query_scale_type == 'cond_scalar':
-            self.query_scale = MLP(d_model, d_model, 1, 2)
-        elif query_scale_type == 'fix_elewise':
-            self.query_scale = nn.Embedding(num_layers, d_model)
-        else:
-            raise NotImplementedError("Unknown query_scale_type: {}".format(query_scale_type))
 
         self.gf_mlp = MLP(d_model, d_model, d_model, 2)
         self.gf_mlp2 = MLP(d_model, d_model, d_model, 2)
@@ -305,24 +297,6 @@ class PosDecoder(nn.Module):
             roi_feature.append(pooling_r)
         return torch.stack(roi_feature)
 
-    def update_point_or_bbox(self, tmp, reference, original=None):
-        dim_ref = tmp.shape[-1]
-        assert dim_ref in [self.query_dim, self.bbox_dim]
-        if dim_ref == self.bbox_dim:
-            tmp[..., :dim_ref] += inverse_sigmoid(reference)
-            new_reference = tmp[..., :dim_ref].sigmoid()
-        if dim_ref == self.query_dim:
-            tmp[..., :dim_ref] += inverse_sigmoid(reference - original)
-            if original.shape[0] == 306:
-                new_reference = tmp[..., :dim_ref].sigmoid() * torch.tensor([[1 / 18, 1 / 17]]).to(tmp.device)
-            else:
-                new_reference = tmp[..., :dim_ref].sigmoid() * (1 / math.sqrt(original.shape[0]))
-            new_reference = new_reference + original
-
-        #              # ablation for move the grid scale
-        #             tmp[..., :dim_ref] += inverse_sigmoid(reference)
-        #             new_reference = tmp[..., :dim_ref].sigmoid()
-        return new_reference
 
     def generate_context(self, roi_2d, roi_3d, index=None):
         context_2d = self.gf_mlp(roi_2d[index])
@@ -333,10 +307,9 @@ class PosDecoder(nn.Module):
     def forward(
             self,
             query_tgt: Optional[Tensor] = None,
-            salient_point: Optional[Tensor] = None,
-            salient_bbox: Optional[Tensor] = None,
-            query_time: Optional[Tensor] = None, 
-            query_mask: Optional[Tensor] = None, 
+            pred_boxes: Optional[Tensor] = None,
+            query_time: Optional[Tensor] = None,
+            query_mask: Optional[Tensor] = None,
             encoded_feature: Optional[Tensor] = None,
             encoded_pos: Optional[Tensor] = None,
             encoded_mask: Optional[Tensor] = None,
@@ -354,52 +327,28 @@ class PosDecoder(nn.Module):
 
         for layer_id, layer in enumerate(self.layers):
 
-            obj_point = salient_point[..., :2]  # [num_queries, batch_size, 2]
-            obj_bbox = salient_bbox[..., :4]  # [num_queries, batch_size, 4]
-            query_sine_embed = gen_sineembed_for_position(obj_point)  # [num_queries, batch_size, d_model]
-            bbox_query_sine_embed = gen_sineembed_for_position(
-                torch.cat([obj_point - obj_bbox[..., :2], obj_point + obj_bbox[..., 2:]],
-                          dim=-1))  # [num_queries, batch_size, 2*d_model]
-            query_pos = self.ref_point_head(query_sine_embed)  # [num_queries, batch_size, d_model]
-            bbox_query_pos = self.ref_bbox_head(bbox_query_sine_embed)  # [num_queries, batch_size, d_model]
+            query_sine_embed = gen_sineembed_for_position(pred_boxes)
+            query_pos = self.ref_point_head(query_sine_embed)  # generated the position embedding
 
             # For the first decoder layer, we do not apply transformation over p_s
-            if self.query_scale_type != 'fix_elewise':
-                if layer_id == 0:
-                    pos_transformation = 1
-                else:
-                    pos_transformation = self.query_scale(query_tgt)
-
+            if layer_id == 0:
+                pos_transformation = 1
+                point_boxes = box_cxcywh_to_xyxy(pred_boxes)
+                point_boxes = torch.cat(
+                    [(point_boxes[:,:,0] + point_boxes[:,:,2]) / 2, ((point_boxes[:,:,0] + point_boxes[:,:,2]) / 2)], dim=1)
+                point_boxes = point_boxes.unsqueeze(1)
+                salient_bbox = point_boxes.detach()
             else:
-                pos_transformation = self.query_scale.weight[layer_id]
+                pos_transformation = self.query_scale(query_tgt)
 
-            #             apply transformation
-            query_sine_embed = query_sine_embed * pos_transformation
-            #pos_sine_embed = pos
-
-            # add box transformation
-            if layer_id != 0:
-                bbox_query_sine_embed = bbox_query_sine_embed * pos_transformation.repeat(1, 1, 2)
-            # get sine embedding for the query vector
-            # query_sine_embed = gen_sineembed_for_position(pred_boxes)
-            # query_pos = self.ref_point_head(query_sine_embed)  # generated the position embedding
-            #
-            # # For the first decoder layer, we do not apply transformation over p_s
-            # if layer_id == 0:
-            #     pos_transformation = 1
-            # else:
-            #     pos_transformation = self.query_scale(query_tgt)
-            #
-            # # apply transformation
-            # query_sine_embed = query_sine_embed[..., :self.d_model] * pos_transformation
+            # apply transformation
+            query_sine_embed = query_sine_embed[..., :self.d_model] * pos_transformation
 
             query_tgt, temp_weights = layer(
                 query_tgt=query_tgt, query_pos=query_pos,
                 query_time_embed=query_time, query_sine_embed=query_sine_embed, query_mask=query_mask,
                 encoded_feature=encoded_feature, encoded_pos=encoded_pos, encoded_mask=encoded_mask,
-                bbox_query_pos=bbox_query_pos, bbox_query_sine_embed=bbox_query_sine_embed,
-                context=context, is_first=(layer_id == 0), key_pos=key_pos, point_pos=salient_point,
-                           bbox_ltrb=salient_bbox)
+                context=context, is_first=(layer_id == 0), key_pos=key_pos,point_pos=salient_bbox)
 
             # iter update
             if self.bbox_embed is not None:
@@ -407,6 +356,12 @@ class PosDecoder(nn.Module):
                 new_pred_boxes = tmp.sigmoid()
                 ref_anchors.append(new_pred_boxes)
                 pred_boxes = new_pred_boxes.detach()
+                point_boxes = box_cxcywh_to_xyxy(new_pred_boxes)
+                point_boxes = torch.cat(
+                    [(point_boxes[:, :, 0] + point_boxes[:, :, 2]) / 2,
+                     ((point_boxes[:, :, 0] + point_boxes[:, :, 2]) / 2)], dim=1)
+                point_boxes = point_boxes.unsqueeze(1)
+                salient_bbox = point_boxes.detach()
 
             target_boxes, gt_bbox_slice = self.gt_info(targets)
 
@@ -423,9 +378,6 @@ class PosDecoder(nn.Module):
                 context_indexs = self.get_context_index_by_our(conf_list[-1], self.theta_s)
 
                 pred_time = torch.nonzero(time_info > self.theta_t).squeeze(-1).tolist()
-                # if isinstance(pred_time, int):
-                #    pred_time = [pred_time]
-
                 context_indexs = [int(i) for i in context_indexs if i in pred_time]
 
             context = self.generate_context(roi_2d, roi_3d, context_indexs) if len(context_indexs) > 0 else None
@@ -435,6 +387,8 @@ class PosDecoder(nn.Module):
                 if self.return_weights:
                     intermediate_weights.append(temp_weights)
 
+
+        # 结束迭代后的处理
         if self.norm is not None:
             query_tgt = self.norm(query_tgt)
             if self.return_intermediate:
@@ -453,13 +407,15 @@ class PosDecoder(nn.Module):
                     torch.stack(intermediate).transpose(1, 2),
                     pred_boxes.unsqueeze(0).transpose(1, 2)
                 ]
+        del ref_anchors, roi_2d, roi_3d, target_boxes, gt_bbox_slice, conf_list, intermediate
+        torch.cuda.empty_cache()
 
         if self.return_weights:
             return outputs, torch.stack(intermediate_weights)
         else:
             return outputs
 
-
+# @profile
 class PosDecoderLayer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -470,27 +426,22 @@ class PosDecoderLayer(nn.Module):
         dropout = cfg.MODEL.CG.DROPOUT
         activation = "relu"
         self.sa_qcontent_proj = nn.Linear(d_model, d_model)
-        self.sa_point_qpos_proj = nn.Linear(d_model, d_model)
-        self.sa_bbox_qpos_proj = nn.Linear(d_model, d_model)
+        self.sa_qpos_proj = nn.Linear(d_model, d_model)
         self.sa_qtime_proj = nn.Linear(d_model, d_model)
         self.sa_kcontent_proj = nn.Linear(d_model, d_model)
-        self.sa_point_kpos_proj = nn.Linear(d_model, d_model)
+        self.sa_kpos_proj = nn.Linear(d_model, d_model)
         self.sa_ktime_proj = nn.Linear(d_model, d_model)
-        self.sa_bbox_kpos_proj = nn.Linear(d_model, d_model)
         self.sa_v_proj = nn.Linear(d_model, d_model)
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, vdim=d_model)
 
         # Decoder Cross-Attention
         self.ca_qcontent_proj = nn.Linear(d_model, d_model)
-        self.ca_point_qpos_proj = nn.Linear(d_model, d_model)
-        self.ca_bbox_qpos_proj = nn.Linear(d_model, d_model)
+        self.ca_qpos_proj = nn.Linear(d_model, d_model)
         self.ca_kcontent_proj = nn.Linear(d_model, d_model)
         self.ca_kpos_proj = nn.Linear(d_model, d_model)
         self.ca_qtime_proj = nn.Linear(d_model, d_model)
         self.ca_v_proj = nn.Linear(d_model, d_model)
-        self.ca_bbox_qpos_sine_proj = nn.Linear(d_model * 2, d_model)
         self.ca_qpos_sine_proj = nn.Linear(d_model, d_model)
-
 
         self.from_scratch_cross_attn = cfg.MODEL.CG.FROM_SCRATCH
         self.cross_attn_image = None
@@ -509,7 +460,7 @@ class PosDecoderLayer(nn.Module):
         if self.sdg:
             self.gaussian_proj = MLP(d_model, d_model, 4 * nhead, 3)  # if sdg is True
         if self.from_scratch_cross_attn:
-            self.cross_attn = MultiheadAttention(d_model * 3, nhead, dropout=dropout, vdim=d_model)
+            self.cross_attn = MultiheadAttention(d_model * 2, nhead, dropout=dropout, vdim=d_model)
         else:
             self.cross_attn_image = nn.MultiheadAttention(d_model, nhead, dropout=dropout, vdim=d_model)
 
@@ -555,35 +506,40 @@ class PosDecoderLayer(nn.Module):
             encoded_feature: Optional[Tensor] = None,
             encoded_pos: Optional[Tensor] = None,
             encoded_mask: Optional[Tensor] = None,
-            bbox_query_pos: Optional[Tensor] = None,
-            bbox_query_sine_embed: Optional[Tensor] = None,
             context=None,
             is_first=False,
             key_pos=None,
             point_pos=None,
-            bbox_ltrb=None,
     ):
         # Apply projections here
         # shape: num_queries x batch_size x 256
         # ========== Begin of Self-Attention =============
         q_content = self.sa_qcontent_proj(query_tgt)  # target is the input of the first decoder layer. zero by default.
         q_time = self.sa_qtime_proj(query_time_embed)
-        q_point_pos = self.sa_point_qpos_proj(query_pos)
-        q_bbox_pos = self.sa_bbox_qpos_proj(bbox_query_pos)
+        q_pos = self.sa_qpos_proj(query_pos)
         k_content = self.sa_kcontent_proj(query_tgt)
-        bs, num_queries, n_model = k_content.shape
         k_time = self.sa_ktime_proj(query_time_embed)
-        k_point_pos = self.sa_point_kpos_proj(query_pos)
-        k_bbox_pos = self.sa_bbox_kpos_proj(bbox_query_pos)
+        k_pos = self.sa_kpos_proj(query_pos)
         v = self.sa_v_proj(query_tgt)
 
-        q = q_content + q_time + q_point_pos + q_bbox_pos
-        k = k_content + k_time + k_point_pos + k_bbox_pos
+        q = q_content + q_time + q_pos
+        k = k_content + k_time + k_pos
+        bs, num_queries, n_model = k_content.shape
 
         # Temporal Self attention
         tgt2, weights = self.self_attn(q, k, value=v)
         tgt = query_tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
+        # ========== End of Self-Attention =============
+
+        if context != None:
+            tgt = self.ca2(tgt, context.unsqueeze(0).expand(query_mask.size(-1), context.size(0), context.size(1)))
+
+        # ========== Begin of Cross-Attention =============
+        # Time Aligned Cross attention
+        t, b, c = tgt.shape  # b is the video number
+        n_tokens, bs, f = encoded_feature.shape  # bs is the total frames in a batch
+        assert f == c  # all the token dim should be same
         # ========== End of Self-Attention =============
 
         if self.sdg:
@@ -598,12 +554,12 @@ class PosDecoderLayer(nn.Module):
                      :self.nhead * 2].tanh()  # if negative multiple left/top, elif positive multiple right/down
 
             point_pos = (point_pos * memory_size[None, None, :]).repeat(1, 1, self.nhead)
-            bbox_ltrb = bbox_ltrb * memory_size[None, None, :].repeat(1, 1, 2)
-            bbox_ltrb = torch.stack((-bbox_ltrb[..., :2], bbox_ltrb[..., 2:]), dim=2).repeat(1, 1, 1, self.nhead)
-            sample_offset = bbox_ltrb * offset.unsqueeze(2)
-            sample_offset = sample_offset.max(-2)
-            sample_offset = sample_offset[0] * (2 * sample_offset[1] - 1)
-            sample_point_pos = point_pos + sample_offset
+            # bbox_ltrb = bbox_ltrb * memory_size[None, None, :].repeat(1, 1, 2)
+            # bbox_ltrb = torch.stack((-bbox_ltrb[..., :2], bbox_ltrb[..., 2:]), dim=2).repeat(1, 1, 1, self.nhead)
+            # sample_offset = bbox_ltrb * offset.unsqueeze(2)
+            # sample_offset = sample_offset.max(-2)
+            # sample_offset = sample_offset[0] * (2 * sample_offset[1] - 1)
+            sample_point_pos = point_pos
 
             #             # ablation on noinner
             #             sample_point_pos = point_pos.repeat(1, 1, self.nhead) + offset
@@ -629,59 +585,79 @@ class PosDecoderLayer(nn.Module):
         if context != None:
             tgt = self.ca2(tgt, context.unsqueeze(0).expand(query_mask.size(-1),context.size(0),context.size(1)))
 
-        # ========== Begin of Cross-Attention =============
-        # Time Aligned Cross attention
-        t, b, c = tgt.shape    # b is the video number
-        n_tokens, bs, f = encoded_feature.shape   # bs is the total frames in a batch
-        assert f == c   # all the token dim should be same
-
         q_content = self.ca_qcontent_proj(tgt)
         k_content = self.ca_kcontent_proj(encoded_feature)
         v = self.ca_v_proj(encoded_feature)
 
-        bs, num_queries, n_model = q_content.shape
-        hw, _, _ = k_content.shape
-
         k_pos = self.ca_kpos_proj(encoded_pos)
 
-        # For the first decoder layer, we add the positional embedding predicted from
-        # the object query (the positional embedding) into the original query (key) in DETR.
-        if is_first or self.keep_query_pos:
-            # #             for transformation
-            #             k_pos = self.ca_kpos_proj(pos)
-            q_point_pos = self.ca_point_qpos_proj(query_pos)
-            q_bbox_pos = self.ca_bbox_qpos_proj(bbox_query_pos)
-            q = q_content + q_point_pos + q_bbox_pos
+        if is_first:
+            q_pos = self.ca_qpos_proj(query_pos)
+            q = q_content + q_pos
             k = k_content + k_pos
         else:
             q = q_content
             k = k_content
 
-        # peca
-        q = q.view(num_queries, bs, self.nhead, n_model // self.nhead)
+        q = q.view(t, b, self.nhead, c // self.nhead)
         query_sine_embed = self.ca_qpos_sine_proj(query_sine_embed)
-        query_sine_embed = query_sine_embed.view(num_queries, bs, self.nhead, n_model // self.nhead)
+        query_sine_embed = query_sine_embed.view(t, b, self.nhead, c // self.nhead)
 
-        bbox_query_sine_embed = self.ca_bbox_qpos_sine_proj(bbox_query_sine_embed)
-        bbox_query_sine_embed = bbox_query_sine_embed.view(num_queries, bs, self.nhead, n_model // self.nhead)
-        q = torch.cat([q, query_sine_embed, bbox_query_sine_embed], dim=3).view(num_queries, bs, n_model * 3)
+        if self.from_scratch_cross_attn:
+            q = torch.cat([q, query_sine_embed], dim=3).view(t, b, c * 2)
+        else:
+            q = (q + query_sine_embed).view(t, b, c)
+            q = q + self.ca_qtime_proj(query_time_embed)
 
-        k = k.view(hw, bs, self.nhead, n_model // self.nhead)
-        k_pos = k_pos.view(hw, bs, self.nhead, n_model // self.nhead)
-        k = torch.cat([k, k_pos, k_pos], dim=3).view(hw, bs, n_model * 3)
+        k = k.view(n_tokens, bs, self.nhead, f // self.nhead)
+        k_pos = k_pos.view(n_tokens, bs, self.nhead, f // self.nhead)
 
-        # relative positional encoing as bias adding to the attention map before softmax operation
-        tgt2, attn_weights, attn_q, attn_k = self.cross_attn(query=q, key=k,
-                                                             value=v,
-                                                             gaussian_map=gaussian_map)
+        if self.from_scratch_cross_attn:
+            k = torch.cat([k, k_pos], dim=3).view(n_tokens, bs, f * 2)
+        else:
+            k = (k + k_pos).view(n_tokens, bs, f)
 
-        tgt = tgt + self.dropout3(tgt2.transpose(0,1))
+        # extract the actual video length query
+        device = tgt.device
+        if self.from_scratch_cross_attn:
+            q_cross = torch.zeros(1, bs, 2 * c).to(device)
+        else:
+            q_cross = torch.zeros(1, bs, c).to(device)
+
+        q_clip = q[:, 0, :]  # t x f
+        q_cross[0, :] = q_clip[:]
+
+        if self.from_scratch_cross_attn:
+            tgt2, attn_weights, attn_q, attn_k = self.cross_attn(
+                query=q_cross,
+                key=k,
+                value=v,
+                gaussian_map=gaussian_map
+            )
+        else:
+            tgt2, attn_weights, attn_q, attn_k = self.cross_attn_image(
+                query=q_cross,
+                key=k,
+                value=v,
+                gaussian_map=gaussian_map
+            )
+
+        # reshape to the batched query
+        tgt2_pad = torch.zeros(1, t * b, c).to(device)
+
+        tgt2_pad[0, :] = tgt2[0, :]
+
+        tgt2 = tgt2_pad
+        tgt2 = tgt2.view(b, t, f).transpose(0, 1)  # 1x(b*t)xf -> bxtxf -> txbxf
+
+        tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
 
         # FFN
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout4(tgt2)
         tgt = self.norm4(tgt)
+
         return tgt, weights
 
 
@@ -695,6 +671,7 @@ class TemplateGenerator(nn.Module):
         self.beta_proj = nn.Linear(self.d_model, self.d_model)
         self.anchor_proj = nn.Linear(self.d_model, self.pos_query_dim)
 
+    #@profile
     def forward(self, frames_cls=None, videos_cls=None):
         gamma_vec = torch.tanh(self.gamma_proj(videos_cls))
         beta_vec = torch.tanh(self.beta_proj(videos_cls))
