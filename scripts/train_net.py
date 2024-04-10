@@ -92,6 +92,7 @@ def train(cfg, local_rank, distributed, logger):
     start_iter = arguments["iteration"]
     start_training_time = time.time()
     end = time.time()
+    model.zero_grad()
 
     for iteration, batch_dict in enumerate(train_data_loader, start_iter):
         model.train()
@@ -130,16 +131,20 @@ def train(cfg, local_rank, distributed, logger):
         # filter unrelated loss
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled)
 
-        optimizer.zero_grad()
+        losses = losses / 4
         losses.backward()
-        if cfg.SOLVER.MAX_GRAD_NORM > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SOLVER.MAX_GRAD_NORM)
-        optimizer.step()
 
-        adjust_learning_rate(cfg, optimizer, iteration, max_iter)
+        if (iteration + 1) % 4 == 0:
+            
+            if cfg.SOLVER.MAX_GRAD_NORM > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SOLVER.MAX_GRAD_NORM)
+            optimizer.step()
+            model.zero_grad()
 
-        if model_ema is not None:
-            update_ema(model, model_ema, cfg.MODEL.EMA_DECAY)
+            adjust_learning_rate(cfg, optimizer, iteration, max_iter)
+
+            if model_ema is not None:
+                update_ema(model, model_ema, cfg.MODEL.EMA_DECAY)
 
         batch_time = time.time() - end
         end = time.time()
@@ -186,6 +191,7 @@ def train(cfg, local_rank, distributed, logger):
 
         if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
             run_eval(cfg, model, model_ema, logger, val_data_loader, device)
+        torch.cuda.empty_cache()
 
     total_training_time = time.time() - start_training_time
     total_time_str = str(datetime.timedelta(seconds=total_training_time))
