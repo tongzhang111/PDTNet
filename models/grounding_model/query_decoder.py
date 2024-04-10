@@ -95,15 +95,6 @@ class QueryDecoder(nn.Module):
         frames_cls = encoded_info["frames_cls"]  # [n_frames, d_model]
         videos_cls = encoded_info["videos_cls"]  # the video-level gloabl contextual token, b x d_model
 
-        meat_info = torch.zeros([1, 2])
-        meat_info[0, 0] = targets[0]['img_size'][0]
-        meat_info[0, 1] = targets[0]['img_size'][1]
-        meat_info = {
-            'size': meat_info,  # (bs, 2)  W, H
-        }
-        _, f, h, w = encoded_feature.shape[1], encoded_feature.shape[2], fea_map_size[0], fea_map_size[1]
-        meat_info["src_size"] = _, f, h, w
-
 
         b = len(encoded_info["durations"])
         t = max(encoded_info["durations"])
