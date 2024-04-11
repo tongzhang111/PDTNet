@@ -34,7 +34,7 @@ class PostProcess(nn.Module):
         pred_boxes = boxes * scale_fct
         # Avoid x1 y1 < 0
         pred_boxes = pred_boxes.clamp(min=0)
-        pred_boxes = _clamp_bbox(pred_boxes, img_h, img_w)
+        pred_boxes = _clamp_bbox(pred_boxes, img_h[0], img_w[0])
 
         b, t, _ = out_sted.shape
         device = out_sted.device
